@@ -1,0 +1,708 @@
+---
+title: "Untitled"
+author: "Zhiyan Yang"
+date: "2025-12-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Packages
+```{r}
+suppressPackageStartupMessages({
+  library(Matrix)
+#  library(PD16Sdata)
+  library(ggplot2)
+  library(lme4)
+  library(RLRsim)
+  library(dplyr)
+  library(purrr)
+  library(tibble)
+  library(parallel)
+  library(doParallel)
+  library(future)
+  library(future.apply)
+  library(tidyverse)
+  library(foreach)
+})
+```
+
+
+
+# 50 times simulation   fitting Lm vs LMM
+```{r}
+
+n_ind <- 100                           
+time_points <- c(0, 6, 12)             
+n_time <- length(time_points)          
+n_obs <- n_ind * n_time                
+n_nutri <- 6                           
+np <- c(100, 100, 100, 100, 100, 100, 400) 
+
+
+sigma_ind <- 2; SD_nutri <- 1; SD_time <- 1; SD_inter <- 1; noise_SD <- 1        
+
+
+true_cls_lmm <- rep(paste0("M", 1:7), times = np)
+
+
+true_cls_lm <- c(
+  rep("L1", 100), # M1 -> L1 (Interact)
+  rep("L2", 100), # M2 -> L2 (Nutri + Time)
+  rep("L3", 100), # M3 -> L3 (Nutri Only)
+  rep("L4", 100), # M4 -> L4 (Time Only)
+  rep("L2", 100), # M5 -> L2 (Nutri + Time, Fixed)
+  rep("L5", 500)  # M6, M7 -> L5 (No Fixed Effect)
+)
+```
+
+## data generation
+```{r}
+
+# M1: inter + nutri + time + RI + residual 
+Generate_M1 <- function(n_ind, n_time, np_M1, Nutri, time_all, sigma_ind, SD_inter, SD_nutri, SD_time, noise_SD) {
+  n_obs <- n_ind * n_time
+  out <- matrix(0, nrow = n_obs, ncol = np_M1)
+  t_idx_vec <- match(time_all, unique(time_points))
+  ind_id <- rep(1:n_ind, each = n_time)
+  
+  for(j in 1:np_M1){
+    gamma_j <- matrix(rnorm(n_time * n_nutri, sd = SD_inter), nrow = n_time, ncol = n_nutri)
+    beta_j  <- rnorm(n_nutri, sd = SD_nutri)
+    alpha_j <- rnorm(n_time, sd = SD_time) 
+    mu_ind <- rnorm(n_ind, sd = sigma_ind)
+    
+    interact_effect <- numeric(n_obs)
+    for(i in 1:n_obs){
+      t_i <- t_idx_vec[i]
+      interact_effect[i] <- as.numeric(Nutri[i,] %*% gamma_j[t_i,])
+    }
+    
+    effect <- interact_effect + as.numeric(Nutri %*% beta_j) + alpha_j[t_idx_vec] + mu_ind[ind_id]
+    out[, j] <- effect + rnorm(n_obs, sd = noise_SD)
+  }
+  return(list(data = out))
+}
+
+# M2
+Generate_M2 <- function(n_ind, n_time, np_M2, Nutri, time_all, sigma_ind, SD_nutri, SD_time, noise_SD) {
+  n_obs <- n_ind * n_time
+  out <- matrix(0, nrow = n_obs, ncol = np_M2)
+  t_idx_vec <- match(time_all, unique(time_points))
+  ind_id <- rep(1:n_ind, each = n_time)
+  
+  for(j in 1:np_M2){
+    beta_j <- rnorm(n_nutri, sd = SD_nutri)
+    alpha_j <- rnorm(n_time, sd = SD_time) 
+    mu_ind <- rnorm(n_ind, sd = sigma_ind)
+    
+    effect <- as.numeric(Nutri %*% beta_j) + alpha_j[t_idx_vec] + mu_ind[ind_id]
+    out[, j] <- effect + rnorm(n_obs, sd = noise_SD)
+  }
+  return(list(data = out))
+}
+
+# M3
+Generate_M3 <- function(n_ind, n_time, np_M3, Nutri, sigma_ind, SD_nutri, noise_SD) {
+  n_obs <- n_ind * n_time
+  out <- matrix(0, nrow = n_obs, ncol = np_M3)
+  ind_id <- rep(1:n_ind, each = n_time)
+  
+  for(j in 1:np_M3){
+    beta_j <- rnorm(n_nutri, sd = SD_nutri)
+    mu_ind <- rnorm(n_ind, sd = sigma_ind)
+    effect <- as.numeric(Nutri %*% beta_j) + mu_ind[ind_id]
+    out[, j] <- effect + rnorm(n_obs, sd = noise_SD)
+  }
+  return(list(data = out))
+}
+
+# M4
+Generate_M4 <- function(n_ind, n_time, np_M4, time_all, sigma_ind, SD_time, noise_SD) {
+  n_obs <- n_ind * n_time
+  out <- matrix(0, nrow = n_obs, ncol = np_M4)
+  t_idx_vec <- match(time_all, unique(time_points))
+  ind_id <- rep(1:n_ind, each = n_time)
+  
+  for(j in 1:np_M4){
+    alpha_j <- rnorm(n_time, sd = SD_time) 
+    mu_ind <- rnorm(n_ind, sd = sigma_ind)
+    effect <- alpha_j[t_idx_vec] + mu_ind[ind_id]
+    out[, j] <- effect + rnorm(n_obs, sd = noise_SD)
+  }
+  return(list(data = out))
+}
+
+# M5
+Generate_M5 <- function(n_ind, n_time, np_M5, Nutri, time_all, SD_nutri, SD_time, noise_SD) {
+  n_obs <- n_ind * n_time
+  out <- matrix(0, nrow = n_obs, ncol = np_M5)
+  t_idx_vec <- match(time_all, unique(time_points))
+  
+  for(j in 1:np_M5){
+    beta_j <- rnorm(n_nutri, sd = SD_nutri)
+    alpha_j <- rnorm(n_time, sd = SD_time) 
+    effect <- as.numeric(Nutri %*% beta_j) + alpha_j[t_idx_vec]
+    out[, j] <- effect + rnorm(n_obs, sd = noise_SD)
+  }
+  return(list(data = out))
+}
+
+# M6
+Generate_M6 <- function(n_ind, n_time, np_M6, sigma_ind, noise_SD) {
+  n_obs <- n_ind * n_time
+  out <- matrix(0, nrow = n_obs, ncol = np_M6)
+  ind_id <- rep(1:n_ind, each = n_time)
+  
+  for(j in 1:np_M6){
+    mu_ind <- rnorm(n_ind, sd = sigma_ind)
+    effect <- mu_ind[ind_id]
+    out[, j] <- effect + rnorm(n_obs, sd = noise_SD)
+  }
+  return(list(data = out))
+}
+
+# M7
+Generate_M7 <- function(n_ind, n_time, np_M7, noise_SD) {
+  n_obs <- n_ind * n_time
+  out <- matrix(0, nrow = n_obs, ncol = np_M7)
+  for(j in 1:np_M7){
+    out[, j] <- rnorm(n_obs, sd = noise_SD)
+  }
+  return(list(data = out))
+}
+
+
+Generate_S <- function(n_ind, n_time, np, Nutri, time_all, sigma_ind, SD_nutri, SD_time, SD_inter, noise_SD) {
+  res_M1 <- Generate_M1(n_ind, n_time, np[1], Nutri, time_all, sigma_ind, SD_inter, SD_nutri, SD_time, noise_SD)
+  res_M2 <- Generate_M2(n_ind, n_time, np[2], Nutri, time_all, sigma_ind, SD_nutri, SD_time, noise_SD)
+  res_M3 <- Generate_M3(n_ind, n_time, np[3], Nutri, sigma_ind, SD_nutri, noise_SD)
+  res_M4 <- Generate_M4(n_ind, n_time, np[4], time_all, sigma_ind, SD_time, noise_SD)
+  res_M5 <- Generate_M5(n_ind, n_time, np[5], Nutri, time_all, SD_nutri, SD_time, noise_SD)
+  res_M6 <- Generate_M6(n_ind, n_time, np[6], sigma_ind, noise_SD)
+  res_M7 <- Generate_M7(n_ind, n_time, np[7], noise_SD)
+  
+  D <- cbind(res_M1$data, res_M2$data, res_M3$data, res_M4$data, res_M5$data, res_M6$data, res_M7$data)
+  return(list(data = D))
+}
+```
+
+
+## classification rules
+
+```{r}
+# --- LM ---
+core_lm_classifier <- function(yvec, base_df, nutri_terms, alpha = 0.05) {
+  safe_lm <- function(form, data) tryCatch(lm(form, data = data), error = function(e) NULL)
+  df <- base_df; df$y <- as.numeric(yvec)
+  
+  f_full <- as.formula(paste0("y ~ time * (", nutri_terms, ")"))
+  f_add  <- as.formula(paste0("y ~ time + ", nutri_terms))
+  f_noN  <- as.formula("y ~ time")
+  f_noT  <- as.formula(paste0("y ~ ", nutri_terms))
+  
+  lm_full <- safe_lm(f_full, df); lm_add <- safe_lm(f_add, df)
+  lm_noN <- safe_lm(f_noN, df); lm_noT <- safe_lm(f_noT, df)
+  
+  p_inter <- if(!is.null(lm_full) & !is.null(lm_add)) anova(lm_add, lm_full)$`Pr(>F)`[2] else NA
+  p_N     <- if(!is.null(lm_add) & !is.null(lm_noN))  anova(lm_noN, lm_add)$`Pr(>F)`[2] else NA
+  p_T     <- if(!is.null(lm_add) & !is.null(lm_noT))  anova(lm_noT, lm_add)$`Pr(>F)`[2] else NA
+  
+  sig <- function(p) !is.na(p) && p < alpha
+  
+  if (sig(p_inter)) return("L1")
+  if (sig(p_N) && sig(p_T)) return("L2")
+  if (sig(p_N)) return("L3")
+  if (sig(p_T)) return("L4")
+  return("L5")
+}
+```
+
+
+```{r}
+# ---  LMM  ---
+core_lmm_classifier <- function(yvec, base_df, nutri_terms, alpha = 0.05) {
+
+  ctrl <- lmerControl(check.conv.singular = "ignore", calc.derivs = FALSE)
+  safe_lmer <- function(form, data, REML) {
+    tryCatch(lmer(form, data = data, REML = REML, control = ctrl),
+             error = function(e) NULL, warning = function(w) invokeRestart("muffleWarning"))
+  }
+  
+  df <- base_df; df$y <- as.numeric(yvec)
+  
+  
+  f_add_ml  <- as.formula(paste0("y ~ time + ", nutri_terms, " + (1|id)"))
+  f_full_ml <- as.formula(paste0("y ~ time * (", nutri_terms, ") + (1|id)"))
+  f_noN_ml  <- as.formula("y ~ time + (1|id)")
+  f_noT_ml  <- as.formula(paste0("y ~ ", nutri_terms, " + (1|id)"))
+  
+  # fitting models with ML to calc LRT statistics
+  m_add  <- safe_lmer(f_add_ml,  df, REML = FALSE)
+  m_full <- safe_lmer(f_full_ml, df, REML = FALSE)
+  m_noN  <- safe_lmer(f_noN_ml,  df, REML = FALSE)
+  m_noT  <- safe_lmer(f_noT_ml,  df, REML = FALSE)
+  
+  
+  p_inter <- if (!is.null(m_add) && !is.null(m_full)) anova(m_add, m_full)$`Pr(>Chisq)`[2] else NA_real_
+  p_N     <- if (!is.null(m_noN) && !is.null(m_add))  anova(m_noN, m_add)$`Pr(>Chisq)`[2] else NA_real_
+  p_T     <- if (!is.null(m_noT) && !is.null(m_add))  anova(m_noT, m_add)$`Pr(>Chisq)`[2] else NA_real_
+  
+
+  m_add_REML <- safe_lmer(update(f_add_ml, . ~ .), df, REML = TRUE)
+  
+  p_RI <- NA_real_
+  if (!is.null(m_add_REML)) {
+    try_rlrt <- tryCatch(RLRsim::exactRLRT(m_add_REML), error = function(e) NULL)
+    if (!is.null(try_rlrt)) {
+      p_RI <- try_rlrt$p.value
+    } else {
+      vc <- VarCorr(m_add_REML)
+      var_id <- attr(vc$id, "stddev")^2
+      if(var_id < 1e-4) p_RI <- 1.0 else p_RI <- 0.0 
+    }
+  }
+  
+
+  sig <- function(p) is.finite(p) && p < alpha
+  
+  pred <- "M7" #  (All Non-Sig)
+  
+  if (sig(p_inter)) {
+    # Path 1: Interaction Significant -> M1
+    pred <- "M1"
+  } else {
+    # Path 2: No Interaction
+    if (sig(p_RI)) {
+      # Path 2.1: Random Intercept Significant
+      if (sig(p_N) && sig(p_T)) {
+        pred <- "M2"
+      } else if (sig(p_N) && !sig(p_T)) {
+        pred <- "M3"
+      } else if (!sig(p_N) && sig(p_T)) {
+        pred <- "M4"
+      } else {
+        pred <- "M6" # RI Sig, but no fixed effects
+      }
+    } else {
+      # Path 2.2: No Random Intercept (Fixed Effects Only)
+      if (sig(p_N) || sig(p_T)) {
+         # M5 : No RI, No Inter, but has Nutri OR Time.
+         pred <- "M5"
+      }
+    }
+  }
+  
+  return(pred)
+}
+
+```
+
+
+## mapping to 5 new classes to compare with LM in the same dimension
+```{r}
+map_lmm_to_5class <- function(labels) {
+  new_labels <- character(length(labels))
+  
+  # M1 -> M1' (Interaction)
+  new_labels[labels == "M1"] <- "M1'"
+  
+  # M2, M5 -> M2' (Nutri + Time)
+  new_labels[labels %in% c("M2", "M5")] <- "M2'"
+  
+  # M3 -> M3' (Nutri Only)
+  new_labels[labels == "M3"] <- "M3'"
+  
+  # M4 -> M4' (Time Only)
+  new_labels[labels == "M4"] <- "M4'"
+  
+  # M6, M7 -> M5' (No Fixed Effect)
+  new_labels[labels %in% c("M6", "M7")] <- "M5'"
+  
+  return(new_labels)
+}
+```
+
+
+##  simulation func
+
+```{r}
+run_comparison_simulation <- function(B = 20, n_cores_to_use = 4) {
+  
+  cat(sprintf("\n===== | B=%d | Cores=%d ===\n", B, n_cores_to_use))
+  
+  cl <- makeCluster(n_cores_to_use)
+  registerDoParallel(cl)
+  
+
+  res_lm        <- list(acc = numeric(B), cm = list()) # 1. LM 
+  res_lmm_raw   <- list(acc = numeric(B), cm = list()) # 2. LMM Raw 
+  res_lmm_map   <- list(acc = numeric(B), cm = list()) # 3. LMM Mapped 
+  
+  
+  # A. LM true label
+  raw_true_lm <- c(rep("L1", 100), rep("L2", 100), rep("L3", 100),
+                   rep("L4", 100), rep("L2", 100), rep("L5", 500))
+  
+  # B. LMM Raw label
+  raw_true_lmm <- rep(paste0("M", 1:7), times = np)
+  
+  # C. LMM Mapped label
+  mapped_true_lmm <- map_lmm_to_5class(raw_true_lmm)
+  
+  
+  for (b in 1:B) {
+    Nutri_new <- matrix(rnorm(n_obs * n_nutri), nrow = n_obs, ncol = n_nutri)
+    colnames(Nutri_new) <- paste0("Nutri", 1:n_nutri)
+    NutriC_new <- scale(Nutri_new, center = TRUE, scale = FALSE)
+    
+    time_all_vec <- rep(time_points, times = n_ind)
+    design_df <- data.frame(id = factor(rep(1:n_ind, each = n_time)), 
+                            time = factor(time_all_vec))
+    base_df_new <- cbind(design_df, as.data.frame(NutriC_new))
+    nutri_terms_new <- paste(colnames(Nutri_new), collapse = " + ")
+    
+    sim_res <- Generate_S(n_ind, n_time, np, Nutri_new, time_all_vec,
+                          sigma_ind, SD_nutri, SD_time, SD_inter, noise_SD)
+    D_mat <- sim_res$data
+    
+    pred_lm <- foreach(j = 1:ncol(D_mat), .combine = c, 
+                       .export = c("core_lm_classifier"), .packages = "stats") %dopar% {
+                         core_lm_classifier(D_mat[, j], base_df_new, nutri_terms_new)
+                       }
+    
+    pred_lmm_raw <- foreach(j = 1:ncol(D_mat), .combine = c, 
+                            .export = c("core_lmm_classifier"), 
+                            .packages = c("lme4", "RLRsim", "stats")) %dopar% {
+                              core_lmm_classifier(D_mat[, j], base_df_new, nutri_terms_new)
+                            }
+    
+
+    
+    # Group 1: LM (L1-L5)
+    t_lm <- factor(raw_true_lm, levels = paste0("L", 1:5))
+    p_lm <- factor(pred_lm, levels = paste0("L", 1:5))
+    res_lm$acc[b]    <- mean(t_lm == p_lm)
+    res_lm$cm[[b]]   <- table(True = t_lm, Pred = p_lm)
+    
+    # Group 2: LMM Raw (M1-M7)
+    t_raw <- factor(raw_true_lmm, levels = paste0("M", 1:7))
+    p_raw <- factor(pred_lmm_raw, levels = paste0("M", 1:7))
+    res_lmm_raw$acc[b]  <- mean(t_raw == p_raw)
+    res_lmm_raw$cm[[b]] <- table(True = t_raw, Pred = p_raw)
+    
+    # Group 3: LMM Mapped (M1'-M5')
+    p_map_char <- map_lmm_to_5class(pred_lmm_raw)
+    
+    lvl_map <- paste0("M", 1:5, "'") # Levels: M1', M2', ...
+    t_map <- factor(mapped_true_lmm, levels = lvl_map)
+    p_map <- factor(p_map_char, levels = lvl_map)
+    
+    res_lmm_map$acc[b]  <- mean(t_map == p_map)
+    res_lmm_map$cm[[b]] <- table(True = t_map, Pred = p_map)
+    
+
+    cat(sprintf("\rloading: %d / %d | LM: %.3f | LMM(Raw): %.3f | LMM(Map): %.3f", 
+                b, B, res_lm$acc[b], res_lmm_raw$acc[b], res_lmm_map$acc[b]))
+  }
+  
+  stopCluster(cl)
+  cat("\n=== End of simulations ===\n")
+  return(list(lm = res_lm, lmm_raw = res_lmm_raw, lmm_map = res_lmm_map))
+}
+
+```
+
+## run simulation func
+
+```{r}
+my_cores <- max(1, parallel::detectCores() - 2)
+
+results <- run_comparison_simulation(B = 50, n_cores_to_use = my_cores)
+
+
+print_res <- function(res_obj, title) {
+  mean_acc <- mean(res_obj$acc)
+  sd_acc   <- sd(res_obj$acc)
+  avg_cm   <- Reduce("+", res_obj$cm) / length(res_obj$cm)
+  
+  cat(paste0("\n\n################ ", title, " ################\n"))
+  cat(sprintf("(Mean Accuracy): %.3f (SD: %.3f)\n", mean_acc, sd_acc))
+  cat("(Average Confusion Matrix):\n")
+  print(round(avg_cm, 1))
+}
+
+# --- 1. LM 结果 (L1-L5) ---
+print_res(results$lm, "LM performance (L1-L5)")
+
+# --- 2. LMM 原始结果 (M1-M7) ---
+print_res(results$lmm_raw, "LMM performance (M1-M7)")
+
+# --- 3. LMM 映射结果 (M1'-M5') ---
+print_res(results$lmm_map, "Mapped LMM performance (M1'-M5')")
+```
+
+
+# different sample sizes  simulation
+```{r}
+run_simulation_for_specific_N <- function(current_n, B, n_cores) {
+  
+  current_n_obs <- current_n * n_time
+
+  raw_true_lm <- c(rep("L1", 100), rep("L2", 100), rep("L3", 100),
+                   rep("L4", 100), rep("L2", 100), rep("L5", 500))
+  raw_true_lmm <- rep(paste0("M", 1:7), times = np)
+  mapped_true_lmm <- map_lmm_to_5class(raw_true_lmm)
+  
+
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  on.exit(stopCluster(cl)) 
+  
+ 
+  acc_lm_vec <- numeric(B)
+  acc_lmm_vec <- numeric(B)
+  
+  
+  for (b in 1:B) {
+    Nutri_new <- matrix(rnorm(current_n_obs * n_nutri), nrow = current_n_obs, ncol = n_nutri)
+    colnames(Nutri_new) <- paste0("Nutri", 1:n_nutri)
+    NutriC_new <- scale(Nutri_new, center = TRUE, scale = FALSE)
+    
+    time_all_vec <- rep(time_points, times = current_n)
+    design_df <- data.frame(id = factor(rep(1:current_n, each = n_time)), 
+                            time = factor(time_all_vec))
+    base_df_new <- cbind(design_df, as.data.frame(NutriC_new))
+    nutri_terms_new <- paste(colnames(Nutri_new), collapse = " + ")
+    
+    sim_res <- Generate_S(current_n, n_time, np, Nutri_new, time_all_vec,
+                          sigma_ind, SD_nutri, SD_time, SD_inter, noise_SD)
+    D_mat <- sim_res$data
+    
+    pred_lm <- foreach(j = 1:ncol(D_mat), .combine = c, 
+                       .export = c("core_lm_classifier"), .packages = "stats") %dopar% {
+                         core_lm_classifier(D_mat[, j], base_df_new, nutri_terms_new)
+                       }
+    
+    pred_lmm_raw <- foreach(j = 1:ncol(D_mat), .combine = c, 
+                            .export = c("core_lmm_classifier"), 
+                            .packages = c("lme4", "RLRsim", "stats")) %dopar% {
+                              core_lmm_classifier(D_mat[, j], base_df_new, nutri_terms_new)
+                            }
+    
+    # LM acc
+    t_lm <- factor(raw_true_lm, levels = paste0("L", 1:5))
+    p_lm <- factor(pred_lm, levels = paste0("L", 1:5))
+    acc_lm_vec[b] <- mean(t_lm == p_lm)
+    
+    # LMM (Mapped) acc
+    p_map_char <- map_lmm_to_5class(pred_lmm_raw)
+    lvl_map <- paste0("M", 1:5, "'")
+    t_map <- factor(mapped_true_lmm, levels = lvl_map)
+    p_map <- factor(p_map_char, levels = lvl_map)
+    acc_lmm_vec[b] <- mean(t_map == p_map)
+    
+
+    if(b %% 10 == 0) cat(".") 
+  }
+  
+  return(data.frame(
+    n_ind = current_n,
+    Run_ID = 1:B,
+    Acc_LM = acc_lm_vec,
+    Acc_LMM = acc_lmm_vec
+  ))
+}
+
+# main loop 
+
+n_list <- c(50, 100, 150, 200)
+B_runs <- 20  
+my_cores <- max(1, parallel::detectCores() - 1)
+
+all_results_list <- list()
+
+cat(sprintf("\n===start simulations  N = %s | B = %d ===\n", paste(n_list, collapse=","), B_runs))
+
+for (N in n_list) {
+  cat(sprintf("\n now, n_ind = %d ", N))
+  # 运行该样本量下的模拟
+  res_df <- run_simulation_for_specific_N(current_n = N, B = B_runs, n_cores = my_cores)
+  all_results_list[[as.character(N)]] <- res_df
+  cat(" End of simulations")
+}
+
+final_data <- bind_rows(all_results_list)
+
+
+# visualization
+
+plot_data <- final_data %>%
+  tidyr::pivot_longer(
+    cols = c("Acc_LM", "Acc_LMM"),
+    names_to = "Model_Type",
+    values_to = "Accuracy"
+  ) %>%
+  mutate(
+    Model_Type = ifelse(Model_Type == "Acc_LM", "LM (Linear Model)", "LMM (Mixed Model)"),
+    n_ind_factor = factor(n_ind, levels = n_list) 
+  )
+
+p <- ggplot(plot_data, aes(x = n_ind_factor, y = Accuracy, fill = Model_Type)) +
+  geom_boxplot(position = position_dodge(0.8), width = 0.7, alpha = 0.8) +
+  geom_jitter(position = position_dodge(0.8), size = 0.8, alpha = 0.3, color = "black") + 
+  scale_fill_manual(values = c("LM (Linear Model)" = "#E69F00", "LMM (Mixed Model)" = "#56B4E9")) +
+  labs(
+    title = paste0("Model Accuracy Comparison across Sample Sizes (B=", B_runs, ")"),
+    subtitle = "LM vs LMM (Mapped to 5 Classes)",
+    x = "Sample Size (n_ind)",
+    y = "Classification Accuracy",
+    fill = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.x = element_blank()
+  )
+
+print(p)
+
+summary_stats <- plot_data %>%
+  group_by(n_ind, Model_Type) %>%
+  summarise(
+    Mean_Acc = mean(Accuracy),
+    SD_Acc = sd(Accuracy),
+    .groups = "drop"
+  )
+
+print(summary_stats)
+```
+
+
+
+
+
+
+# Delta RSS comparison  LMM vs LM
+
+```{r}
+get_delta_rss <- function(yvec, base_df, nutri_terms) {
+  
+  df <- base_df
+  df$y <- as.numeric(yvec)
+  
+  # --- LM  ---
+  f_lm_full <- as.formula(paste0("y ~ time * (", nutri_terms, ")"))
+  f_lm_red  <- as.formula(paste0("y ~ time + ", nutri_terms)) 
+  
+  m_lm_full <- tryCatch(lm(f_lm_full, data = df), error=function(e) NULL)
+  m_lm_red  <- tryCatch(lm(f_lm_red, data = df), error=function(e) NULL)
+  
+  delta_lm <- NA
+  if(!is.null(m_lm_full) && !is.null(m_lm_red)) {
+    delta_lm <- sum(residuals(m_lm_red)^2) - sum(residuals(m_lm_full)^2)
+  }
+  
+  # --- LMM  ---
+  f_lmm_full <- as.formula(paste0("y ~ time * (", nutri_terms, ") + (1|id)"))
+  f_lmm_red  <- as.formula(paste0("y ~ time + ", nutri_terms, " + (1|id)"))
+  
+  ctrl <- lmerControl(check.conv.singular = "ignore", calc.derivs = FALSE)
+  
+  m_lmm_full <- tryCatch(lmer(f_lmm_full, data = df, REML = FALSE, control = ctrl), 
+                         error=function(e) NULL)
+  m_lmm_red  <- tryCatch(lmer(f_lmm_red, data = df, REML = FALSE, control = ctrl), 
+                         error=function(e) NULL)
+  
+  delta_lmm <- NA
+  if(!is.null(m_lmm_full) && !is.null(m_lmm_red)) {
+    delta_lmm <- sum(residuals(m_lmm_red)^2) - sum(residuals(m_lmm_full)^2)
+  }
+  
+  return(c(Delta_LM = delta_lm, Delta_LMM = delta_lmm))
+}
+
+
+# main loop with normalization
+
+run_normalized_simulation <- function(n_list, B_runs=1, n_cores=4) {
+  
+  cat(sprintf("\n===  Normalized Delta RSS STARTING (Sigma=%d) ===\n", sigma_ind))
+  
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  on.exit(stopCluster(cl))
+  
+  results_list <- list()
+  
+  for (N in n_list) {
+    cat(sprintf("\n N = %d ...", N))
+    
+    current_n_obs <- N * n_time
+    time_vec <- rep(time_points, times = N)
+    
+    Nutri_new <- matrix(rnorm(current_n_obs * n_nutri), nrow = current_n_obs, ncol = n_nutri)
+    colnames(Nutri_new) <- paste0("Nutri", 1:n_nutri)
+    NutriC_new <- scale(Nutri_new, center = TRUE, scale = FALSE)
+    
+    design_df <- data.frame(id = factor(rep(1:N, each = n_time)), time = factor(time_vec))
+    base_df_new <- cbind(design_df, as.data.frame(NutriC_new))
+    nutri_terms_new <- paste(colnames(Nutri_new), collapse = " + ")
+    
+    
+    D_mat <- Generate_S_Standard(N, n_time, np, Nutri_new, time_vec, sigma_ind, noise_SD)
+    
+    
+    res_mat <- foreach(j = 1:ncol(D_mat), .combine = rbind, 
+                       .export = c("get_delta_rss"), 
+                       .packages = c("lme4", "stats")) %dopar% {
+                         get_delta_rss(D_mat[, j], base_df_new, nutri_terms_new)
+                       }
+    
+    
+    df_temp <- as.data.frame(res_mat)
+    
+
+    df_temp$Delta_LM  <- df_temp$Delta_LM / N
+    df_temp$Delta_LMM <- df_temp$Delta_LMM / N
+    
+    df_temp$N_ind <- factor(N, levels = n_list)
+    df_temp$True_Model <- rep(paste0("M", 1:7), times = np)
+    
+    results_list[[as.character(N)]] <- df_temp
+  }
+  
+  return(bind_rows(results_list))
+}
+
+
+# visualization
+
+my_cores <- max(1, parallel::detectCores() - 1)
+
+delta_norm_data <- run_normalized_simulation(n_ind_list, B_runs = 1, n_cores = my_cores)
+
+p_norm <- ggplot(delta_norm_data, aes(x = Delta_LM, y = Delta_LMM, color = N_ind)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", size = 1) +
+  labs(
+    title = "Normalized Delta RSS Comparison (Interaction Term)",
+    subtitle = "Values are divided by Sample Size (N). LM vs LMM.",
+    caption = "Diagonal line implies: (Delta RSS_LM / N) ≈ (Delta RSS_LMM / N)",
+    x = "Delta RSS / N (Linear Model)",
+    y = "Delta RSS / N (Mixed Model)",
+    color = "Sample Size (N)"
+  ) +
+  theme_minimal() +
+  coord_fixed(ratio = 1) 
+
+print(p_norm)
+
+ggsave("Normalized_Delta_RSS.png", p_norm, width = 8, height = 8)
+ggsave("Normalized_Delta_RSS.pdf", p_norm, width = 8, height = 8)
+
+```
+
