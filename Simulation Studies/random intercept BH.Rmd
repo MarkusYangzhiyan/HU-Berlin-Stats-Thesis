@@ -1,0 +1,294 @@
+---
+title: "random intercept BH"
+author: "Zhiyan Yang"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(lme4)
+library(RLRsim)
+library(doParallel)
+library(foreach)
+library(stats)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+
+
+SimConfig <- list(
+  n_ind = 100,
+  time_points = c(0, 6, 12),
+  n_nutri = 6,
+  np = c(M1=100, M2=100, M3=100, M4=100, M5=100, M6=100, M7=400),
+  sigma_ind = 2, 
+  sd_nutri = 1, 
+  sd_time = 1, 
+  sd_inter = 1, 
+  sd_noise = 1,
+  alpha = 0.05
+)
+
+get_base_design <- function(n_ind, time_points, n_nutri) {
+  n_time <- length(time_points)
+  n_obs <- n_ind * n_time
+  id_vec <- rep(1:n_ind, each = n_time)
+  time_vec <- rep(time_points, times = n_ind)
+  Nutri <- matrix(rnorm(n_obs * n_nutri), nrow = n_obs, ncol = n_nutri)
+  colnames(Nutri) <- paste0("Nutri", 1:n_nutri)
+  Nutri_scaled <- scale(Nutri, center = TRUE, scale = FALSE)
+  base_df <- data.frame(id = factor(id_vec), time = factor(time_vec))
+  base_df <- cbind(base_df, as.data.frame(Nutri_scaled))
+  return(list(df = base_df, nutri_mat = Nutri_scaled, n_obs = n_obs))
+}
+
+```
+
+
+
+
+
+```{r}
+
+generate_features <- function(model_type, n_features, design_list, config) {
+  df <- design_list$df; Nutri <- design_list$nutri_mat
+  n_obs <- design_list$n_obs; n_time <- length(config$time_points)
+  n_ind <- config$n_ind; n_nutri <- config$n_nutri
+  time_idx <- as.numeric(df$time); ind_idx <- as.numeric(df$id)
+  out_mat <- matrix(0, nrow = n_obs, ncol = n_features)
+  
+  for (j in 1:n_features) {
+    beta_nutri <- rnorm(n_nutri, sd = config$sd_nutri)
+    beta_time  <- rnorm(n_time,  sd = config$sd_time)
+    gamma_inter <- matrix(rnorm(n_time * n_nutri, sd = config$sd_inter), nrow = n_time, ncol = n_nutri)
+    mu_ind <- rnorm(n_ind, sd = config$sigma_ind)
+    
+    eff_nutri <- as.numeric(Nutri %*% beta_nutri)
+    eff_time  <- beta_time[time_idx]
+    eff_rand  <- mu_ind[ind_idx]
+    eff_inter <- numeric(n_obs)
+    
+    if (model_type == "M1") {
+      for(t in 1:n_time) {
+        rows <- which(time_idx == t)
+        eff_inter[rows] <- Nutri[rows, ] %*% gamma_inter[t, ]
+      }
+    }
+    
+    y_true <- switch(model_type,
+      "M1" = eff_inter + eff_nutri + eff_time + eff_rand,
+      "M2" = eff_nutri + eff_time + eff_rand,
+      "M3" = eff_nutri + eff_rand,
+      "M4" = eff_time + eff_rand,
+      "M5" = eff_nutri + eff_time,
+      "M6" = eff_rand,
+      "M7" = rep(0, n_obs)
+    )
+    out_mat[, j] <- y_true + rnorm(n_obs, sd = config$sd_noise)
+  }
+  return(out_mat)
+}
+
+generate_simulation_dataset <- function(config) {
+  design <- get_base_design(config$n_ind, config$time_points, config$n_nutri)
+  data_list <- list()
+  true_labels <- c()
+  for (m in names(config$np)) {
+    n_feat <- config$np[[m]]
+    if (n_feat > 0) {
+      data_list[[m]] <- generate_features(m, n_feat, design, config)
+      true_labels <- c(true_labels, rep(m, n_feat))
+    }
+  }
+  return(list(
+    data = do.call(cbind, data_list),
+    base_df = design$df,
+    nutri_terms = paste(colnames(design$nutri_mat), collapse = " + "),
+    true_labels = true_labels
+  ))
+}
+
+
+```
+
+
+
+```{r}
+calc_p_values_lmm <- function(y, base_df, formula_rhs_base) {
+  df <- base_df; df$y <- y
+  term_fixed <- formula_rhs_base
+  
+  f_ml_full <- as.formula(paste0("y ~ time * (", term_fixed, ") + (1|id)"))
+  f_ml_add  <- as.formula(paste0("y ~ time + ", term_fixed, " + (1|id)"))
+  f_ml_noN  <- as.formula("y ~ time + (1|id)")
+  f_ml_noT  <- as.formula(paste0("y ~ ", term_fixed, " + (1|id)"))
+  f_reml_add <- as.formula(paste0("y ~ time + ", term_fixed, " + (1|id)"))
+  
+  ctrl <- lmerControl(check.conv.singular = "ignore", calc.derivs = FALSE)
+  fit_lmer <- function(f, reml) {
+    tryCatch(lmer(f, data = df, REML = reml, control = ctrl),
+             error = function(e) NULL, warning = function(w) invokeRestart("muffleWarning"))
+  }
+  
+  m_full <- fit_lmer(f_ml_full, FALSE)
+  m_add  <- fit_lmer(f_ml_add, FALSE)
+  m_noN  <- fit_lmer(f_ml_noN, FALSE)
+  m_noT  <- fit_lmer(f_ml_noT, FALSE)
+  
+  get_lrt_p <- function(m_reduced, m_complex) {
+    if(!is.null(m_reduced) && !is.null(m_complex)) 
+      anova(m_reduced, m_complex)$`Pr(>Chisq)`[2] else NA
+  }
+  
+  p_inter <- get_lrt_p(m_add, m_full)
+  p_N     <- get_lrt_p(m_noN, m_add)
+  p_T     <- get_lrt_p(m_noT, m_add)
+  
+  m_reml <- fit_lmer(f_reml_add, TRUE)
+  p_RI <- 1.0
+  if (!is.null(m_reml)) {
+    res_rlrt <- tryCatch(RLRsim::exactRLRT(m_reml), error = function(e) NULL)
+    if (!is.null(res_rlrt)) {
+      p_RI <- res_rlrt$p.value
+    } else {
+      vc <- VarCorr(m_reml)
+      if (as.numeric(attr(vc$id, "stddev")) > 1e-3) p_RI <- 0.0 else p_RI <- 1.0
+    }
+  }
+  
+  return(c(p_inter = p_inter, p_N = p_N, p_T = p_T, p_RI = p_RI))
+}
+
+apply_decision_rules <- function(p_vec, alpha) {
+  p_inter <- p_vec["p_inter"]
+  p_N     <- p_vec["p_N"]
+  p_T     <- p_vec["p_T"]
+  p_RI    <- p_vec["p_RI"]
+  
+  is_sig <- function(p) !is.na(p) && p < alpha
+  
+  if (is_sig(p_inter)) return("M1")
+  
+  # No Interaction
+  if (is_sig(p_RI)) {
+    if (is_sig(p_N) && is_sig(p_T))      return("M2")
+    if (is_sig(p_N) && !is_sig(p_T))     return("M3")
+    if (!is_sig(p_N) && is_sig(p_T))     return("M4")
+    return("M6") # RI only
+  } else {
+    if (is_sig(p_N) || is_sig(p_T))      return("M5") # Fixed only
+    return("M7") # Noise
+  }
+}
+
+
+```
+
+
+```{r}
+
+
+run_simulation_bh_comparison <- function(B = 5, config, n_cores = 4) {
+  
+  cat(sprintf("\n===  LMM vs LMM+BH  | simulation times: %d | #cores: %d ===\n", B, n_cores))
+  
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  
+  acc_records <- data.frame(
+    Simulation = integer(B),
+    Acc_Raw = numeric(B),
+    Acc_BH = numeric(B)
+  )
+  
+  for (b in 1:B) {
+    set.seed(123 + b)
+    
+    sim_data <- generate_simulation_dataset(config)
+    y_mat <- sim_data$data
+    base_df <- sim_data$base_df
+    nutri_terms <- sim_data$nutri_terms
+    true_labels <- sim_data$true_labels
+    
+
+    p_values_mat <- foreach(j = 1:ncol(y_mat), 
+                            .combine = rbind,
+                            .packages = c("lme4", "RLRsim", "stats"),
+                            .export = c("calc_p_values_lmm")) %dopar% {
+      calc_p_values_lmm(y_mat[, j], base_df, nutri_terms)
+    }
+    
+
+    preds_raw <- apply(p_values_mat, 1, function(x) apply_decision_rules(x, config$alpha))
+    
+    tbl_raw <- table(factor(true_labels, levels=paste0("M",1:7)), 
+                     factor(preds_raw, levels=paste0("M",1:7)))
+    acc_raw <- sum(diag(tbl_raw)) / sum(tbl_raw)
+    
+
+    p_values_bh <- apply(p_values_mat, 2, function(x) p.adjust(x, method = "BH"))
+    
+    preds_bh <- apply(p_values_bh, 1, function(x) apply_decision_rules(x, config$alpha))
+    
+    tbl_bh <- table(factor(true_labels, levels=paste0("M",1:7)), 
+                    factor(preds_bh, levels=paste0("M",1:7)))
+    acc_bh <- sum(diag(tbl_bh)) / sum(tbl_bh)
+    
+    acc_records$Simulation[b] <- b
+    acc_records$Acc_Raw[b] <- acc_raw
+    acc_records$Acc_BH[b]  <- acc_bh
+    
+    cat(sprintf("\r finished round: %d/%d | Raw Acc: %.3f | BH Acc: %.3f", b, B, acc_raw, acc_bh))
+  }
+  
+  stopCluster(cl)
+  cat("\n end of simulation。\n")
+  return(acc_records)
+}
+
+```
+
+
+
+```{r}
+
+n_cores_use <- max(1, parallel::detectCores() - 1)
+sim_results <- run_simulation_bh_comparison(B = 10, config = SimConfig, n_cores = n_cores_use)
+
+plot_data <- sim_results %>%
+  pivot_longer(cols = c(Acc_Raw, Acc_BH), 
+               names_to = "Method", 
+               values_to = "Accuracy") %>%
+  mutate(Method = factor(Method, levels = c("Acc_Raw", "Acc_BH"), 
+                         labels = c("Standard LMM", "LMM + BH Correction")))
+
+mean_diff <- mean(sim_results$Acc_BH - sim_results$Acc_Raw)
+cat(sprintf("\n acc improved (BH - Raw): %.4f\n", mean_diff))
+
+
+```
+
+```{r}
+p <- ggplot(plot_data, aes(x = Method, y = Accuracy, fill = Method)) +
+  geom_boxplot(width = 0.5, alpha = 0.7) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.6) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4, fill = "white") + 
+  labs(title = "Impact of BH Correction on Classification Accuracy",
+       subtitle = sprintf("Simulation over %d iterations (Average Gain: +%.1f%%)", 
+                          max(sim_results$Simulation), mean_diff * 100),
+       y = "Classification Accuracy",
+       x = "Method") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Set2")
+
+
+print(p)
+```
+
