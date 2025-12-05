@@ -1,0 +1,556 @@
+---
+title: "random slope only"
+author: "Zhiyan Yang"
+date: "2025-12-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# ANOVA-like Test of Random slope LMM 
+```{r}
+# ==============================================================================
+# 0. global settings 
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lme4)
+  library(lmerTest)
+  library(foreach)
+  library(doParallel)
+  library(ggplot2)
+})
+
+
+time_points <- c(0, 6, 12)
+n_time <- length(time_points)
+n_nutri <- 6
+np <- c(100, 100, 100, 100, 100, 100, 400) 
+
+
+sigma_slope <- 0.5 
+noise_SD <- 1
+SD_nutri <- 1; SD_time <- 1; SD_inter <- 1
+
+# --- True label ---
+# LM (5)
+raw_true_lm <- c(rep("L1", 100), rep("L2", 100), rep("L3", 100),
+                 rep("L4", 100), rep("L2", 100), rep("L5", 500))
+# LMM (7->5)
+raw_true_lmm <- rep(paste0("M", 1:7), times = np)
+
+# ==============================================================================
+# 1. helper function
+# ==============================================================================
+
+# mapping (M1-M7 -> M1'-M5')
+map_lmm_to_5class <- function(labels) {
+  new_labels <- character(length(labels))
+  new_labels[labels == "M1"] <- "M1'"
+  new_labels[labels %in% c("M2", "M5")] <- "M2'"
+  new_labels[labels == "M3"] <- "M3'"
+  new_labels[labels == "M4"] <- "M4'"
+  new_labels[labels %in% c("M6", "M7")] <- "M5'"
+  return(new_labels)
+}
+
+ 
+get_random_slope_effect <- function(n_ind, n_time, time_all, sigma_slope) {
+  b_i <- rnorm(n_ind, sd = sigma_slope)
+  ind_id <- rep(1:n_ind, each = n_time)
+  return(b_i[ind_id] * time_all)
+}
+
+# ==============================================================================
+# 2. data generation (Random Slope Only)
+# ==============================================================================
+Generate_S_RS_Compact <- function(n_ind, n_time, np, Nutri, time_all, sigma_slope, noise_SD) {
+  
+  n_obs <- n_ind * n_time
+  t_idx_vec <- match(time_all, unique(time_points))
+  
+  D <- matrix(0, nrow = n_obs, ncol = sum(np))
+  current_col <- 1
+  
+  for (m in 1:7) {
+    n_cols <- np[m]
+    if (n_cols == 0) next
+    
+    mat_m <- matrix(0, nrow = n_obs, ncol = n_cols)
+    
+    for (j in 1:n_cols) {
+      rs_effect <- numeric(n_obs)
+      
+      if (m %in% c(1, 2, 3, 4, 6)) {
+        rs_effect <- get_random_slope_effect(n_ind, n_time, time_all, sigma_slope)
+      }
+      
+      fixed_effect <- numeric(n_obs)
+      
+      if (m == 1) { # Interaction
+        gamma <- matrix(rnorm(n_time * n_nutri, sd=1), nrow=n_time)
+        beta <- rnorm(n_nutri, sd=1); alpha <- rnorm(n_time, sd=1)
+        
+        inter <- numeric(n_obs)
+        for(i in 1:n_obs) inter[i] <- sum(Nutri[i,] * gamma[t_idx_vec[i],])
+        fixed_effect <- inter + as.numeric(Nutri %*% beta) + alpha[t_idx_vec]
+      } else if (m == 2 || m == 5) { # N + T 
+        beta <- rnorm(n_nutri, sd=1); alpha <- rnorm(n_time, sd=1)
+        fixed_effect <- as.numeric(Nutri %*% beta) + alpha[t_idx_vec]
+      } else if (m == 3) { # N only
+        beta <- rnorm(n_nutri, sd=1)
+        fixed_effect <- as.numeric(Nutri %*% beta)
+      } else if (m == 4) { # T only
+        alpha <- rnorm(n_time, sd=1)
+        fixed_effect <- alpha[t_idx_vec]
+      } 
+      # M6, M7 fixed_effect is 0
+      
+    
+      mat_m[, j] <- fixed_effect + rs_effect + rnorm(n_obs, sd = noise_SD)
+    }
+    
+
+    D[, current_col:(current_col + n_cols - 1)] <- mat_m
+    current_col <- current_col + n_cols
+  }
+  return(D)
+}
+
+# ==============================================================================
+# 3. classification 
+# ==============================================================================
+
+# --- A. LM ---
+core_lm_classifier <- function(yvec, base_df, nutri_terms, alpha = 0.05) {
+  safe_lm <- function(form, data) tryCatch(lm(form, data = data), error = function(e) NULL)
+  df <- base_df; df$y <- as.numeric(yvec)
+  
+  # factor(time)
+  f_full <- as.formula(paste0("y ~ time_fac * (", nutri_terms, ")"))
+  f_add  <- as.formula(paste0("y ~ time_fac + ", nutri_terms))
+  f_noN  <- as.formula("y ~ time_fac")
+  f_noT  <- as.formula(paste0("y ~ ", nutri_terms))
+  
+  lm_full <- safe_lm(f_full, df); lm_add <- safe_lm(f_add, df)
+  lm_noN <- safe_lm(f_noN, df); lm_noT <- safe_lm(f_noT, df)
+  
+  p_inter <- if(!is.null(lm_full) & !is.null(lm_add)) anova(lm_add, lm_full)$`Pr(>F)`[2] else NA
+  p_N     <- if(!is.null(lm_add) & !is.null(lm_noN))  anova(lm_noN, lm_add)$`Pr(>F)`[2] else NA
+  p_T     <- if(!is.null(lm_add) & !is.null(lm_noT))  anova(lm_noT, lm_add)$`Pr(>F)`[2] else NA
+  
+  sig <- function(p) !is.na(p) && p < alpha
+  if (sig(p_inter)) return("L1")
+  if (sig(p_N) && sig(p_T)) return("L2")
+  if (sig(p_N)) return("L3")
+  if (sig(p_T)) return("L4")
+  return("L5")
+}
+
+# --- B. LMM (Random Slope) ---
+core_lmm_rs_classifier <- function(yvec, base_df, nutri_terms, alpha = 0.05) {
+  library(lme4); library(lmerTest)
+  ctrl <- lmerControl(check.conv.singular = "ignore", calc.derivs = FALSE)
+  safe_lmer <- function(form, data, REML) {
+    tryCatch(lmer(form, data = data, REML = REML, control = ctrl),
+             error = function(e) NULL, warning = function(w) invokeRestart("muffleWarning"))
+  }
+  
+  df <- base_df; df$y <- as.numeric(yvec)
+  
+  #(0 + time_num | id)
+  term_rs <- "(0 + time_num | id)"
+  f_full <- as.formula(paste0("y ~ time_fac * (", nutri_terms, ") + ", term_rs))
+  f_add  <- as.formula(paste0("y ~ time_fac + ", nutri_terms, " + ", term_rs))
+  f_noN  <- as.formula(paste0("y ~ time_fac + ", term_rs))
+  f_noT  <- as.formula(paste0("y ~ ", nutri_terms, " + ", term_rs))
+  
+  m_full <- safe_lmer(f_full, df, REML = FALSE)
+  m_add  <- safe_lmer(f_add,  df, REML = FALSE)
+  m_noN  <- safe_lmer(f_noN,  df, REML = FALSE)
+  m_noT  <- safe_lmer(f_noT,  df, REML = FALSE)
+  
+
+  p_inter <- if (!is.null(m_add) && !is.null(m_full)) anova(m_add, m_full)$`Pr(>Chisq)`[2] else NA
+  p_N     <- if (!is.null(m_noN) && !is.null(m_add))  anova(m_noN, m_add)$`Pr(>Chisq)`[2] else NA
+  p_T     <- if (!is.null(m_noT) && !is.null(m_add))  anova(m_noT, m_add)$`Pr(>Chisq)`[2] else NA
+  
+  p_RS <- NA
+  f_lm_add <- as.formula(paste0("y ~ time_fac + ", nutri_terms))
+  lm_add   <- tryCatch(lm(f_lm_add, data = df), error=function(e) NULL)
+  
+  if (!is.null(m_add) && !is.null(lm_add)) {
+    m_add@call$data <- quote(df)
+    lm_add$call$data <- quote(df)
+    
+    lrt <- tryCatch(anova(m_add, lm_add), error = function(e) NULL)
+    if (!is.null(lrt)) p_RS <- lrt$`Pr(>Chisq)`[2]
+  }
+  
+  sig <- function(p) !is.na(p) && p < alpha
+  pred <- "M7"
+  
+  if (sig(p_inter)) {
+    pred <- "M1"
+  } else {
+    if (sig(p_RS)) { # Random Slope Significant
+      if (sig(p_N) && sig(p_T)) pred <- "M2"
+      else if (sig(p_N) && !sig(p_T)) pred <- "M3"
+      else if (!sig(p_N) && sig(p_T)) pred <- "M4"
+      else pred <- "M6"
+    } else { # No Random Slope
+      if (sig(p_N) || sig(p_T)) pred <- "M5"
+    }
+  }
+  return(pred)
+}
+
+# ==============================================================================
+# 4. main 
+# ==============================================================================
+
+run_rs_simulation_varying_N <- function(n_list, B_runs, n_cores) {
+  
+  cat(sprintf("\n=== Random Slope Simulation | N: %s | B: %d ===\n", 
+              paste(n_list, collapse=","), B_runs))
+  
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  on.exit(stopCluster(cl))
+  
+  results_list <- list()
+  
+  # LM: L1-L5
+  t_lm_fac <- factor(raw_true_lm, levels = paste0("L", 1:5))
+  # LMM Mapped: M1'-M5'
+  mapped_lmm_labels <- map_lmm_to_5class(raw_true_lmm)
+  t_lmm_fac <- factor(mapped_lmm_labels, levels = paste0("M", 1:5, "'"))
+  
+  # --- Loop N ---
+  for (N in n_list) {
+    cat(sprintf("\nProcessing N = %d ", N))
+    
+    current_n_obs <- N * n_time
+    time_vec <- rep(time_points, times = N)
+    
+    acc_lm_vec <- numeric(B_runs)
+    acc_lmm_vec <- numeric(B_runs)
+    
+    # --- Loop B ---
+    for (b in 1:B_runs) {
+      
+      # 1. Nutri and DF
+      Nutri_new <- matrix(rnorm(current_n_obs * n_nutri), nrow = current_n_obs, ncol = n_nutri)
+      colnames(Nutri_new) <- paste0("Nutri", 1:n_nutri)
+      NutriC_new <- scale(Nutri_new, center = TRUE, scale = FALSE)
+      
+      design_df <- data.frame(
+        id = factor(rep(1:N, each = n_time)),
+        time_fac = factor(time_vec),       
+        time_num = as.numeric(time_vec)   
+      )
+      base_df_new <- cbind(design_df, as.data.frame(NutriC_new))
+      nutri_terms_new <- paste(colnames(Nutri_new), collapse = " + ")
+      
+      D_mat <- Generate_S_RS_Compact(N, n_time, np, Nutri_new, time_vec, sigma_slope, noise_SD)
+      
+      # 3. LM fitting
+      pred_lm <- foreach(j = 1:ncol(D_mat), .combine = c, 
+                         .export = c("core_lm_classifier"), .packages = "stats") %dopar% {
+                           core_lm_classifier(D_mat[, j], base_df_new, nutri_terms_new)
+                         }
+      
+      # 4. LMM fitting 
+      pred_lmm_raw <- foreach(j = 1:ncol(D_mat), .combine = c, 
+                              .export = c("core_lmm_rs_classifier"), 
+                              .packages = c("lme4", "lmerTest", "stats")) %dopar% {
+                                core_lmm_rs_classifier(D_mat[, j], base_df_new, nutri_terms_new)
+                              }
+      
+      # 5. Acc
+      p_lm_fac <- factor(pred_lm, levels = paste0("L", 1:5))
+      acc_lm_vec[b] <- mean(t_lm_fac == p_lm_fac)
+      
+      p_lmm_map <- map_lmm_to_5class(pred_lmm_raw)
+      p_lmm_fac <- factor(p_lmm_map, levels = paste0("M", 1:5, "'"))
+      acc_lmm_vec[b] <- mean(t_lmm_fac == p_lmm_fac)
+      
+      if(b %% 5 == 0) cat(".")
+    } # end B
+    
+    
+    df_temp <- data.frame(
+      n_ind = N,
+      Run_ID = 1:B_runs,
+      Acc_LM = acc_lm_vec,
+      Acc_LMM = acc_lmm_vec
+    )
+    results_list[[as.character(N)]] <- df_temp
+  } # end N
+  
+  return(bind_rows(results_list))
+}
+
+# ==============================================================================
+# 5. run main + ggplot 
+# ==============================================================================
+
+n_ind_list <- c(50, 100, 150, 200)
+
+B_repeats <- 20 
+my_cores <- max(1, parallel::detectCores() - 1)
+
+
+rs_results <- run_rs_simulation_varying_N(n_ind_list, B_repeats, my_cores)
+
+
+plot_data <- rs_results %>%
+  pivot_longer(cols = c("Acc_LM", "Acc_LMM"), 
+               names_to = "Model", values_to = "Accuracy") %>%
+  mutate(
+    Model = ifelse(Model == "Acc_LM", "LM (Ignore Slope)", "LMM (Random Slope)"),
+    n_ind = factor(n_ind, levels = n_ind_list)
+  )
+
+# Boxplot
+p_rs <- ggplot(plot_data, aes(x = n_ind, y = Accuracy, fill = Model)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(position = position_dodge(width = 0.75), size = 1, alpha = 0.4) +
+  scale_fill_manual(values = c("LM (Ignore Slope)" = "#E69F00", "LMM (Random Slope)" = "#56B4E9")) +
+  labs(
+    title = "Random Slope Data: Model Accuracy vs Sample Size",
+    subtitle = paste0("Data generated with Random Slope (sigma=", sigma_slope, ")"),
+    x = "Sample Size (n_ind)",
+    y = "Classification Accuracy"
+  ) +
+  theme_minimal(base_size = 14)
+
+print(p_rs)
+
+
+ggsave("RandomSlope_Acc_Boxplot.png", p_rs, width = 8, height = 6)
+```
+
+
+# delta RSS comparison of Interaction term
+```{r}
+
+n_ind_list <- c(50, 100, 150, 200) 
+time_points <- c(0, 6, 12)
+n_time <- length(time_points)
+n_nutri <- 6
+
+
+np <- c(100, 100, 100, 100, 100, 100, 400) 
+
+# Random Slope 
+sigma_slope <- 0.5    
+noise_SD <- 1      
+SD_nutri <- 1; SD_time <- 1; SD_inter <- 1
+
+
+Generate_S_RandomSlope <- function(n_ind, n_time, np, Nutri, time_num_vec, sigma_slope, noise_SD) {
+  
+  n_obs <- n_ind * n_time
+
+  t_idx_vec <- match(time_num_vec, unique(sort(time_num_vec)))
+  ind_id <- rep(1:n_ind, each = n_time)
+  
+  D <- matrix(0, nrow = n_obs, ncol = sum(np))
+  current_col <- 1
+  
+  for (m in 1:7) {
+    n_cols <- np[m]
+    if (n_cols == 0) next
+    
+    mat_m <- matrix(0, nrow = n_obs, ncol = n_cols)
+    
+    for (j in 1:n_cols) {
+
+      # b_i
+      b_i <- if (m %in% c(1, 2, 3, 4, 6)) rnorm(n_ind, sd = sigma_slope) else numeric(n_ind)
+      re_effect <- b_i[ind_id] * time_num_vec
+      
+      fix_effect <- numeric(n_obs)
+      
+      # M1: Interaction
+      if (m == 1) { 
+        gamma <- matrix(rnorm(n_time * n_nutri, sd=1), nrow=n_time)
+        beta <- rnorm(n_nutri, sd=1); alpha <- rnorm(n_time, sd=1)
+        inter <- numeric(n_obs)
+        for(i in 1:n_obs) inter[i] <- sum(Nutri[i,] * gamma[t_idx_vec[i],])
+        fix_effect <- inter + as.numeric(Nutri %*% beta) + alpha[t_idx_vec]
+      } 
+      # M2/M5: Main Effects (Nutri + Time)
+      else if (m == 2 || m == 5) { 
+        beta <- rnorm(n_nutri, sd=1); alpha <- rnorm(n_time, sd=1)
+        fix_effect <- as.numeric(Nutri %*% beta) + alpha[t_idx_vec]
+      } 
+      # M3: Nutri Only
+      else if (m == 3) { 
+        beta <- rnorm(n_nutri, sd=1)
+        fix_effect <- as.numeric(Nutri %*% beta)
+      } 
+      # M4: Time Only
+      else if (m == 4) { 
+        alpha <- rnorm(n_time, sd=1)
+        fix_effect <- alpha[t_idx_vec]
+      }
+      # M6, M7: No Fixed Intercept (Pure Random Process as per previous code)
+      
+      mat_m[, j] <- fix_effect + re_effect + rnorm(n_obs, sd = noise_SD)
+    }
+    D[, current_col:(current_col + n_cols - 1)] <- mat_m
+    current_col <- current_col + n_cols
+  }
+  return(D)
+}
+
+# ==============================================================================
+# 2. Delta RSS  of Interaction (Random Slope )
+# ==============================================================================
+get_delta_rss_rs <- function(yvec, base_df, nutri_terms) {
+  
+  df <- base_df
+  df$y <- as.numeric(yvec)
+  
+  # --- LM 
+  f_lm_full <- as.formula(paste0("y ~ time_fac * (", nutri_terms, ")"))
+  f_lm_red  <- as.formula(paste0("y ~ time_fac + ", nutri_terms)) 
+  
+  m_lm_full <- tryCatch(lm(f_lm_full, data = df), error=function(e) NULL)
+  m_lm_red  <- tryCatch(lm(f_lm_red, data = df), error=function(e) NULL)
+  
+  delta_lm <- NA
+  if(!is.null(m_lm_full) && !is.null(m_lm_red)) {
+    delta_lm <- sum(residuals(m_lm_red)^2) - sum(residuals(m_lm_full)^2)
+  }
+  
+  # --- LMM (Random Slope Only) ---
+  # Random Effect : (0 + time_num | id)
+
+  term_rs <- "(0 + time_num | id)"
+  
+  f_lmm_full <- as.formula(paste0("y ~ time_fac * (", nutri_terms, ") + ", term_rs))
+  f_lmm_red  <- as.formula(paste0("y ~ time_fac + ", nutri_terms, " + ", term_rs))
+  
+  ctrl <- lmerControl(check.conv.singular = "ignore", calc.derivs = FALSE)
+  
+  m_lmm_full <- tryCatch(lmer(f_lmm_full, data = df, REML = FALSE, control = ctrl), 
+                         error=function(e) NULL)
+  m_lmm_red  <- tryCatch(lmer(f_lmm_red, data = df, REML = FALSE, control = ctrl), 
+                         error=function(e) NULL)
+  
+  delta_lmm <- NA
+  if(!is.null(m_lmm_full) && !is.null(m_lmm_red)) {
+    # sum of squared residuals
+    delta_lmm <- sum(residuals(m_lmm_red)^2) - sum(residuals(m_lmm_full)^2)
+  }
+  
+  return(c(Delta_LM = delta_lm, Delta_LMM = delta_lmm))
+}
+
+# ==============================================================================
+# 3. main  (Random Slope)
+# ==============================================================================
+run_rs_simulation <- function(n_list, B_runs=1, n_cores=4) {
+  
+  cat(sprintf("\n=== start :Random Slope Delta RSS  (Sigma_Slope=%.1f) ===\n", sigma_slope))
+  
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  on.exit(stopCluster(cl))
+  
+  results_list <- list()
+  
+  for (N in n_list) {
+    cat(sprintf("\n  N = %d ...", N))
+    
+    current_n_obs <- N * n_time
+    time_vec <- rep(time_points, times = N) 
+    
+    Nutri_new <- matrix(rnorm(current_n_obs * n_nutri), nrow = current_n_obs, ncol = n_nutri)
+    colnames(Nutri_new) <- paste0("Nutri", 1:n_nutri)
+    NutriC_new <- scale(Nutri_new, center = TRUE, scale = FALSE)
+    
+    design_df <- data.frame(
+      id = factor(rep(1:N, each = n_time)), 
+      time_fac = factor(time_vec),   # fixed effect
+      time_num = as.numeric(time_vec)# random effect
+    )
+    base_df_new <- cbind(design_df, as.data.frame(NutriC_new))
+    nutri_terms_new <- paste(colnames(Nutri_new), collapse = " + ")
+    
+    # data matrix of Random Slope 
+    D_mat <- Generate_S_RandomSlope(N, n_time, np, Nutri_new, time_vec, sigma_slope, noise_SD)
+    
+    
+    res_mat <- foreach(j = 1:ncol(D_mat), .combine = rbind, 
+                       .export = c("get_delta_rss_rs"), 
+                       .packages = c("lme4", "stats")) %dopar% {
+                         get_delta_rss_rs(D_mat[, j], base_df_new, nutri_terms_new)
+                       }
+    
+    
+    df_temp <- as.data.frame(res_mat)
+    
+    # normalization (Delta RSS / N)
+    df_temp$Delta_LM  <- df_temp$Delta_LM / N
+    df_temp$Delta_LMM <- df_temp$Delta_LMM / N
+    
+    df_temp$N_ind <- factor(N, levels = n_list)
+    df_temp$True_Model <- rep(paste0("M", 1:7), times = np)
+    
+    results_list[[as.character(N)]] <- df_temp
+  }
+  
+  return(bind_rows(results_list))
+}
+
+```
+
+```{r}
+# ==============================================================================
+# 4. run + ggplot 
+# ==============================================================================
+
+my_cores <- max(1, parallel::detectCores() - 1)
+
+if (!exists("rs_plot_data")) {
+  rs_plot_data <- run_rs_simulation(n_ind_list, B_runs = 1, n_cores = my_cores)
+}
+
+plot_data_m1 <- rs_plot_data %>% filter(True_Model == "M1")
+
+p_rs_norm <- ggplot(plot_data_m1, aes(x = Delta_LM, y = Delta_LMM, color = N_ind)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", linewidth = 1) +
+  labs(
+    title = "Normalized Delta RSS Comparison\n(Random Slope Setting)",
+    subtitle = "Values are divided by Sample Size (N). Showing True Model M1.",
+    caption = "Points below diagonal indicate LMM is more conservative",
+    x = "Delta RSS / N (Linear Model)",
+    y = "Delta RSS / N (Mixed Model)",
+    color = "Sample Size (N)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5), 
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 10, unit = "pt")
+  ) +
+  coord_fixed(ratio = 1) +
+  xlim(0, max(plot_data_m1$Delta_LM, na.rm=T)) +
+  ylim(0, max(plot_data_m1$Delta_LM, na.rm=T))
+
+print(p_rs_norm)
+
+ggsave("Normalized_Delta_RSS_RandomSlope_Fixed.png", p_rs_norm, width = 8, height = 8)
+```
+
+
