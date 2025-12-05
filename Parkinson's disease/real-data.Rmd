@@ -1,0 +1,606 @@
+---
+title: "real-data"
+author: "Zhiyan Yang"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(phyloseq)
+library(dplyr)
+load("Data.RData")
+head(sample_data(ps3))
+
+```
+
+```{r}
+real_response <- otu_table(ps3)
+dim(otu_table(ps3))
+```
+
+### pre-preocessing 
+
+```{r}
+# ==============================================================================
+# pre-process: data cleaning + feature selection
+# ==============================================================================
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(phyloseq, dplyr, tibble)
+
+
+if(file.exists("Data.RData")) {
+  load("Data.RData")
+} else {
+  stop("no data ")
+}
+
+
+
+
+
+# meta data ->  data.frame 
+raw_meta <- as(sample_data(ps3), "data.frame")
+if(!"SampleID" %in% colnames(raw_meta)) {
+  raw_meta$SampleID <- rownames(raw_meta)
+}
+
+# pd = yes +  3 repeated measurements
+clean_meta <- raw_meta %>%
+  filter(PD == "yes") %>%
+  group_by(id) %>%
+  filter(n() == 3) %>%
+  ungroup() %>%
+  arrange(id, t) 
+
+
+target_samples <- clean_meta$SampleID
+
+message(paste0("number of samples aftering data cleaning: ", length(target_samples)))
+
+#  W 
+
+target_cols <- c("MOCA.total.score", "LDQ.Score", "Bristol.Score", 
+                 "NMSS.Total.Score", "PDQ.Summary.Index", "UPDRS.Total.Score")
+
+
+W <- clean_meta %>%
+  select(all_of(target_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+rownames(W) <- clean_meta$SampleID
+
+
+#  D 
+
+
+# OTU 
+if(taxa_are_rows(ps3)) {
+  otu_raw <- t(as(otu_table(ps3), "matrix"))
+} else {
+  otu_raw <- as(otu_table(ps3), "matrix")
+}
+
+
+if(!all(target_samples %in% rownames(otu_raw))) {
+  stop("lack sample in otu table")
+}
+
+D <- otu_raw[target_samples, ]
+
+
+# Design matrix
+
+
+design_df <- clean_meta[, c("id", "t")]
+design_df$id <- factor(design_df$id)
+design_df$time_fac <- factor(design_df$t) # time as factor
+
+rownames(design_df) <- clean_meta$SampleID
+
+# check 
+# NA exist?
+if(any(is.na(W))) message("warning: W matrix has NA")
+if(any(is.na(D))) stop("warning: D matrix has NA")
+
+# squential correct?
+check_DW <- identical(rownames(D), rownames(W))
+check_DD <- identical(rownames(D), rownames(design_df))
+
+print(paste("D and W ", check_DW))
+print(paste("D and Design ", check_DD))
+
+
+print(head(W))
+
+```
+
+
+# clustering   ANOVA  vs.  contribution-based
+```{r}
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(lme4, RLRsim, compositions, foreach, doParallel, dplyr, tidyr, ggplot2)
+
+message("--- Step 0: Data Preparation ---")
+
+# 1. CLR 
+D_input <- D + 0.5
+D_clr <- clr(D_input)
+n_feat <- ncol(D_clr)
+
+
+W_scaled <- scale(W, center = TRUE, scale = FALSE)
+W_df <- as.data.frame(W_scaled)
+nutri_names <- colnames(W_df)
+
+nutri_str <- paste(nutri_names, collapse = " + ") 
+
+base_df <- cbind(design_df, W_df)
+
+ctrl <- lmerControl(check.conv.singular = "ignore", calc.derivs = FALSE)
+safe_lmer <- function(f, d, r) tryCatch(suppressWarnings(lmer(f, d, REML=r, control=ctrl)), error=function(e) NULL)
+
+calc_shares_only <- function(fit, df) {
+  if(is.null(fit)) return(rep(0,5))
+  X <- model.matrix(fit); b <- fixef(fit); cn <- colnames(X)
+  
+  
+  pat <- paste(nutri_names, collapse="|")
+  idx_n <- grepl(pat, cn) & !grepl(":", cn)
+  idx_t <- grepl("time", cn) & !grepl(":", cn)
+  idx_i <- grepl(":", cn)
+  
+  calc_ss <- function(idx) {
+    if(sum(idx)==0) return(0)
+
+    eff <- as.numeric(X[,idx,drop=F] %*% b[idx])
+    sum((eff - mean(eff))^2)
+  }
+  
+  SS_n <- calc_ss(idx_n); SS_t <- calc_ss(idx_t); SS_i <- calc_ss(idx_i)
+  ran <- tryCatch(ranef(fit)$id[,1], error=function(e) rep(0, nrow(df)))
+  SS_r <- sum(ran[df$id]^2)
+  SS_e <- sum(residuals(fit)^2)
+  
+  Ttot <- SS_n + SS_t + SS_i + SS_r + SS_e
+  if(Ttot < 1e-10) return(rep(0,5))
+  return(c(SS_i, SS_n, SS_t, SS_r, SS_e) / Ttot)
+}
+
+message(paste("number of features(D):", n_feat))
+message(paste("number of nutri (W):", ncol(W)))
+
+```
+
+
+```{r}
+
+# ==============================================================================
+# Step 1:  semi-parametric Bootstrap to get Cutoffs 
+# ==============================================================================
+message("\n--- Step 1: Bootstrapping Cutoffs (All Features) ---")
+
+
+n_cores <- parallel::detectCores() - 2
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+boot_idx <- 1:n_feat
+
+boot_res <- foreach(j = boot_idx, .combine = rbind, 
+                    .export = c("safe_lmer", "calc_shares_only", "nutri_names"),
+                    .packages = c("lme4")) %dopar% {
+  y <- D_clr[, j]
+  df_b <- base_df; df_b$y <- y
+  f_boot <- as.formula(paste0("y ~ time_fac * (", nutri_str, ") + (1|id)"))
+  fit <- safe_lmer(f_boot, df_b, TRUE)
+  
+  if(is.null(fit)) return(c(NA, NA, NA, NA))
+  
+  X <- model.matrix(fit); b <- fixef(fit); resids <- residuals(fit)
+  ran <- tryCatch(ranef(fit)$id[,1], error=function(e) rep(0, nrow(df_b)))
+  
+  # 1. Null Inter (Remove Interaction term)
+  X_nI <- X[, !grepl(":", colnames(X)), drop=FALSE]
+  b_nI <- b[!grepl(":", names(b))]
+  y_nI <- as.numeric(X_nI %*% b_nI) + ran[df_b$id] + sample(resids, replace=TRUE)
+  df_b$y <- y_nI; s_I <- calc_shares_only(safe_lmer(f_boot, df_b, TRUE), df_b)[1]
+  
+  # 2. Null Nutri (Remove Nutri Main effects)
+  pat <- paste(nutri_names, collapse="|")
+  X_nN <- X[, !grepl(pat, colnames(X)), drop=FALSE]
+  b_nN <- b[!grepl(pat, names(b))]
+  y_nN <- as.numeric(X_nN %*% b_nN) + ran[df_b$id] + sample(resids, replace=TRUE)
+  df_b$y <- y_nN; s_N <- calc_shares_only(safe_lmer(f_boot, df_b, TRUE), df_b)[2]
+  
+  # 3. Null Time (Remove Time Main effect)
+  X_nT <- X[, !grepl("time", colnames(X)), drop=FALSE]
+  b_nT <- b[!grepl("time", names(b))]
+  y_nT <- as.numeric(X_nT %*% b_nT) + ran[df_b$id] + sample(resids, replace=TRUE)
+  df_b$y <- y_nT; s_T <- calc_shares_only(safe_lmer(f_boot, df_b, TRUE), df_b)[3]
+  
+  # 4. Null RI (Remove Random Intercept)
+  y_nR <- as.numeric(X %*% b) + sample(resids, replace=TRUE)
+  df_b$y <- y_nR; s_R <- calc_shares_only(safe_lmer(f_boot, df_b, TRUE), df_b)[4]
+  
+  c(s_I, s_N, s_T, s_R)
+}
+
+# 计算 95% Cutoff
+cutoffs <- apply(boot_res, 2, quantile, probs = 0.95, na.rm = TRUE)
+names(cutoffs) <- c("Inter", "Nutri", "Time", "RI")
+message("Bootstrap Cutoffs Generated:"); print(cutoffs)
+
+
+```
+
+
+```{r}
+
+# ==============================================================================
+# Step 2: p-values and contribution shares
+# ==============================================================================
+message("\n--- Step 2: Full Analysis (Calculating P-values & Real Shares) ---")
+
+
+analyze_feature <- function(y, df_base, nutri_str) {
+  df <- df_base; df$y <- as.numeric(y)
+  
+  
+  f_full <- as.formula(paste0("y ~ time_fac * (", nutri_str, ") + (1|id)"))
+  f_add  <- as.formula(paste0("y ~ time_fac + ", nutri_str, " + (1|id)"))
+  f_noN  <- as.formula("y ~ time_fac + (1|id)")
+  f_noT  <- as.formula(paste0("y ~ ", nutri_str, " + (1|id)"))
+  
+  # fitting 
+  m_full <- safe_lmer(f_full, df, FALSE)
+  m_add  <- safe_lmer(f_add,  df, FALSE)
+  m_noN  <- safe_lmer(f_noN,  df, FALSE)
+  m_noT  <- safe_lmer(f_noT,  df, FALSE)
+  m_reml <- safe_lmer(f_add,  df, TRUE)
+  
+  # calc p-values
+  pi <- 1; pn <- 1; pt <- 1; pr <- 1
+  if(!is.null(m_full) && !is.null(m_add)) pi <- anova(m_add, m_full)$`Pr(>Chisq)`[2]
+  if(!is.null(m_add) && !is.null(m_noN))  pn <- anova(m_noN, m_add)$`Pr(>Chisq)`[2]
+  if(!is.null(m_add) && !is.null(m_noT))  pt <- anova(m_noT, m_add)$`Pr(>Chisq)`[2]
+  if(!is.null(m_reml)) try({ pr <- RLRsim::exactRLRT(m_reml)$p.value[1] }, silent=T)
+  
+  # calc contribution shares of obsers
+  shares <- calc_shares_only(safe_lmer(f_full, df, TRUE), df)
+  
+  c(pi, pn, pt, pr, shares)
+}
+
+full_res <- foreach(j = 1:n_feat, .combine = rbind, 
+                    .export = c("safe_lmer", "calc_shares_only", "nutri_names", "analyze_feature"),
+                    .packages = c("lme4", "RLRsim")) %dopar% {
+  analyze_feature(D_clr[, j], base_df, nutri_str)
+}
+
+stopCluster(cl) 
+
+colnames(full_res) <- c("pi", "pn", "pt", "pr", "si", "sn", "st", "sr", "se")
+res_df <- as.data.frame(full_res)
+res_df$Taxa <- colnames(D_clr)
+
+
+```
+
+
+```{r}
+
+# ==============================================================================
+# Step 3: Classification   (clustering)
+# ==============================================================================
+message("\n--- Step 3: Applying Classification Rules ---")
+
+alpha <- 0.05
+sig <- function(p) !is.na(p) & p < alpha
+
+# --- Method A: ANOVA Rules ---
+pred_anova <- rep(NA, n_feat)
+
+for(i in 1:n_feat) {
+  pi <- res_df$pi[i]; pn <- res_df$pn[i]; pt <- res_df$pt[i]; pr <- res_df$pr[i]
+  
+  # 1. non-sig -> M7
+  if(!sig(pi) && !sig(pn) && !sig(pt) && !sig(pr)) {
+    pred_anova[i] <- "M7"
+  } else {
+    # 2. Inter  -> M1
+    if(sig(pi)) {
+      pred_anova[i] <- "M1"
+    } else {
+      # 3. RI  -> M2/3/4/6
+      if(sig(pr)) {
+        if(sig(pn) && sig(pt))      pred_anova[i] <- "M2"
+        else if(sig(pn))            pred_anova[i] <- "M3"
+        else if(sig(pt))            pred_anova[i] <- "M4"
+        else                        pred_anova[i] <- "M6"
+      } else {
+        # 4. M5
+        pred_anova[i] <- "M5"
+      }
+    }
+  }
+}
+
+# --- Method B: Contribution Rules ---
+pred_contrib <- rep(NA, n_feat)
+
+# 1. non-sig (same with anova-like method)
+is_nonsig <- (res_df$pi >= alpha) & (res_df$pn >= alpha) & 
+             (res_df$pt >= alpha) & (res_df$pr >= alpha)
+pred_contrib[is_nonsig] <- "M7"
+
+mask <- is.na(pred_contrib)
+
+# 2. Inter > Cut -> M1
+pred_contrib[mask & (res_df$si > cutoffs["Inter"])] <- "M1"
+mask <- is.na(pred_contrib)
+
+# 3. RI > Cut -> Random Group
+idx_RI <- mask & (res_df$sr > cutoffs["RI"])
+pred_contrib[idx_RI & (res_df$sn > cutoffs["Nutri"]) & (res_df$st > cutoffs["Time"])] <- "M2"
+pred_contrib[idx_RI & (res_df$sn > cutoffs["Nutri"]) & (res_df$st <= cutoffs["Time"])] <- "M3"
+pred_contrib[idx_RI & (res_df$sn <= cutoffs["Nutri"]) & (res_df$st > cutoffs["Time"])] <- "M4"
+pred_contrib[idx_RI & (res_df$sn <= cutoffs["Nutri"]) & (res_df$st <= cutoffs["Time"])] <- "M6"
+mask <- is.na(pred_contrib)
+
+# 4. Remaining -> M5
+pred_contrib[mask] <- "M5"
+
+
+```
+
+
+
+```{r}
+# Step 4: results
+
+
+final_output <- data.frame(
+  Taxa = res_df$Taxa,
+  
+  # clusters
+  Pred_ANOVA = pred_anova,
+  Pred_Contrib = pred_contrib,
+  
+  # contribution shares
+  Share_Inter = res_df$si,
+  Share_Nutri = res_df$sn,
+  Share_Time  = res_df$st,
+  Share_RI    = res_df$sr,
+  Share_Resid = res_df$se,
+  
+  # P-values
+  P_Inter = res_df$pi,
+  P_Nutri = res_df$pn,
+  P_Time  = res_df$pt,
+  P_RI    = res_df$pr
+)
+
+
+message("[1] ANOVA-like Method:")
+print(table(pred_anova))
+
+message("\n[2] Contribution-based Method:")
+print(table(pred_contrib))
+
+
+plot_df <- final_output %>%
+  pivot_longer(cols = c(Pred_ANOVA, Pred_Contrib), names_to = "Method", values_to = "Model") %>%
+  mutate(Model = factor(Model, levels = paste0("M", 1:7)))
+
+print(
+  ggplot(plot_df, aes(x = Model, fill = Method)) +
+    geom_bar(position = "dodge") +
+    scale_fill_manual(values = c("Pred_ANOVA" = "#E69F00", "Pred_Contrib" = "#56B4E9")) +
+    labs(title = "Classification Comparison on Real PD Data (Full Bootstrap)", 
+         y = "Count", x = "Model Type") +
+    theme_bw()
+)
+
+
+write.csv(final_output, "PD_RealData_Full_Results.csv", row.names = FALSE)
+```
+
+
+
+
+```{r}
+
+# Contribution-based Method  :  Sunburst Plot
+
+library(geomtextpath) 
+df_res <- data.frame(Model = pred_contrib)
+
+#  Hierarchy Definition
+# Level 1: Sig vs Non-sig
+# Level 2: (Inside Sig) Has Random Effect vs No Random Effect
+# Level 3: Specific Models
+
+df_hierarchy <- df_res %>%
+  mutate(
+    # --- Level 1: Significance ---
+    L1 = ifelse(Model == "M7", "Non-sig", "Sig"),
+    
+    # --- Level 2: Random Effect Structure ---
+    L2 = case_when(
+      Model == "M7" ~ "Noise",  
+      Model == "M5" ~ "Fixed Only",
+      TRUE ~ "Mixed Effect" # M1, M2, M3, M4, M6
+    ),
+    
+    # --- Level 3: Specific Model ---
+    L3 = Model
+  )
+
+# 3. Coordinate Construction
+
+plot_data <- df_hierarchy %>%
+  group_by(L1, L2, L3) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(desc(L1), desc(L2), L3)
+
+
+total_count <- sum(plot_data$Count)
+
+# --- Layer 1  ---
+layer1_data <- plot_data %>%
+  group_by(L1) %>%
+  summarise(Count = sum(Count), .groups = "drop") %>%
+  mutate(
+    ymax = cumsum(Count),
+    ymin = lag(ymax, default = 0),
+    xmin = 0.5, xmax = 2.5, 
+    Label = paste0(L1, "\n(", Count, ")"),
+    Fill = L1
+  )
+
+# --- Layer 2 ---
+
+layer2_data <- plot_data %>%
+  group_by(L1, L2) %>%
+  summarise(Count = sum(Count), .groups = "drop") %>%
+  mutate(
+    L1 = factor(L1, levels = layer1_data$L1)
+  ) %>%
+  arrange(L1, desc(L2)) %>% 
+  mutate(
+    ymax = cumsum(Count),
+    ymin = lag(ymax, default = 0),
+    xmin = 2.5, xmax = 4,
+    Label = ifelse(L2 == "Noise", "", paste0(L2, "\n(", Count, ")")), 
+    Fill = L2
+  )
+
+# --- Layer 3 ---
+layer3_data <- plot_data %>%
+  mutate(
+    L1 = factor(L1, levels = layer1_data$L1),
+    L2 = factor(L2, levels = unique(layer2_data$L2)) 
+  ) %>%
+  arrange(L1, L2, L3) %>%
+  mutate(
+    ymax = cumsum(Count),
+    ymin = lag(ymax, default = 0),
+    xmin = 4, xmax = 5, 
+    Label = paste0(L3, " (", Count, ")"),
+    Fill = L3
+  )
+
+```
+
+
+
+
+```{r}
+# Plotting
+
+
+# M7 grau，Sig green，Random blue/purple，Fixed orange
+my_colors <- c(
+  "Non-sig" = "#D3D3D3", "Sig" = "#66C2A5",
+  "Noise" = "#D3D3D3", "Fixed Only" = "#FC8D62", "Mixed Effect" = "#8DA0CB",
+  "M7" = "#D3D3D3", 
+  "M5" = "#FC8D62",
+  "M1" = "#E78AC3", # interaction special color
+  "M2" = "#A6D854", 
+  "M3" = "#FFD92F",
+  "M4" = "#E5C494",
+  "M6" = "#B3B3B3"
+)
+
+p <- ggplot() +
+  # ---  Layer 1 (Inner) ---
+  geom_rect(data = layer1_data,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Fill),
+            color = "white", alpha = 0.8) +
+  
+  # ---  Layer 2 (Middle) ---
+  geom_rect(data = layer2_data,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Fill),
+            color = "white", alpha = 0.8) +
+  
+  # ---  Layer 3 (Outer) ---
+  geom_rect(data = layer3_data,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Fill),
+            color = "white", alpha = 0.8) +
+  
+  coord_polar(theta = "y") +
+  xlim(c(0, 5.5)) + 
+  
+  # Layer 1 Labels
+  geom_text(data = layer1_data,
+            aes(x = 1.5, y = (ymin + ymax)/2, label = Label),
+            color = "black", size = 4, fontface = "bold") +
+  
+  # Layer 2 Labels (Sig )
+  geom_text(data = filter(layer2_data, L2 != "Noise"),
+            aes(x = 3.25, y = (ymin + ymax)/2, label = Label),
+            color = "black", size = 3) +
+  
+  # Layer 3 Labels (Specific Models)
+  geom_text(data = filter(layer3_data, L3 != "M7"), 
+            aes(x = 4.5, y = (ymin + ymax)/2, label = Label),
+            color = "black", size = 2.5) +
+  
+  scale_fill_manual(values = my_colors) +
+  theme_void() +
+  labs(title = "Hierarchical Clustering of Features",
+       subtitle = "Inner: Significance | Middle: Random Effect | Outer: Model Type") +
+  theme(legend.position = "right", 
+        legend.title = element_text(face = "bold")) +
+
+  guides(fill = guide_legend(title = "Cluster"))
+
+print(p)
+
+
+ggsave("Contribution_Sunburst_Plot.png", p, width = 10, height = 8, dpi = 300)
+```
+
+## examples clustered to M1: genus
+
+```{r}
+m1_candidates <- final_output %>%
+  filter(Pred_Contrib == "M1") %>%
+  arrange(desc(Share_Inter)) 
+
+message(paste("found", nrow(m1_candidates), "features"))
+
+if(nrow(m1_candidates) == 0) {
+  stop("check the code plz")
+}
+
+# Top 4
+top_4_m1 <- head(m1_candidates, 4)
+
+# get taxa ID
+target_ids <- top_4_m1$Taxa
+
+
+tax_mat <- as(tax_table(ps3), "matrix")
+tax_df <- as.data.frame(tax_mat) %>%
+  rownames_to_column("Taxa_ID")
+
+
+result_table <- tax_df %>%
+  filter(Taxa_ID %in% target_ids) %>%
+  select(Taxa_ID, Phylum, Family, Genus) %>%
+  
+  left_join(top_4_m1[, c("Taxa", "Share_Inter", "P_Inter")], by = c("Taxa_ID" = "Taxa"))
+
+
+message("\n========== Top 4 M1 Features & Taxonomy ==========")
+print(result_table)
+```
+
