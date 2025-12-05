@@ -1,0 +1,306 @@
+---
+title: "contribution-based BH"
+author: "Zhiyan Yang"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(lme4, RLRsim, ggplot2, dplyr, tidyr, foreach, doParallel, methods)
+
+
+FIXED_N_IND <- 100  
+B <- 10            
+
+
+calc_empirical_p_vec <- function(observed_values, null_distribution) {
+  n_null <- length(null_distribution)
+  p_vals <- sapply(observed_values, function(x) {
+    (sum(null_distribution >= x) + 1) / (n_null + 1)
+  })
+  return(p_vals)
+}
+
+```
+
+
+
+```{r}
+Generate_Data_MC <- function(n_ind) {
+  time_points <- c(0, 6, 12); n_time <- 3; n_obs <- n_ind * 3; n_nutri <- 6
+  np <- c(M1=100, M2=100, M3=100, M4=100, M5=100, M6=100, M7=400)
+  total_feat <- sum(np)
+  
+  Nutri <- matrix(rnorm(n_obs * n_nutri), nrow = n_obs, ncol = n_nutri)
+  colnames(Nutri) <- paste0("Nutri", 1:n_nutri)
+  time_all <- rep(time_points, times = n_ind)
+  t_idx <- match(time_all, unique(time_points)); ind_id <- rep(1:n_ind, each = n_time)
+  
+  D <- matrix(0, nrow = n_obs, ncol = total_feat)
+  curr <- 0
+  
+  # M1
+  for(i in 1:np["M1"]) {
+    curr <- curr + 1
+    gamma_t <- matrix(rnorm(n_time * n_nutri), n_time, n_nutri)
+    eff_inter <- rowSums(Nutri * gamma_t[t_idx, ])
+    D[, curr] <- eff_inter + as.numeric(Nutri %*% rnorm(n_nutri)) + rnorm(n_time)[t_idx] + rnorm(n_ind)[ind_id] + rnorm(n_obs)
+  }
+  # M2-M7
+  for(i in 1:np["M2"]) { curr<-curr+1; D[,curr] <- as.numeric(Nutri%*%rnorm(n_nutri)) + rnorm(n_time)[t_idx] + rnorm(n_ind)[ind_id] + rnorm(n_obs) }
+  for(i in 1:np["M3"]) { curr<-curr+1; D[,curr] <- as.numeric(Nutri%*%rnorm(n_nutri)) + rnorm(n_ind)[ind_id] + rnorm(n_obs) }
+  for(i in 1:np["M4"]) { curr<-curr+1; D[,curr] <- rnorm(n_time)[t_idx] + rnorm(n_ind)[ind_id] + rnorm(n_obs) }
+  for(i in 1:np["M5"]) { curr<-curr+1; D[,curr] <- as.numeric(Nutri%*%rnorm(n_nutri)) + rnorm(n_time)[t_idx] + rnorm(n_obs) }
+  for(i in 1:np["M6"]) { curr<-curr+1; D[,curr] <- rnorm(n_ind)[ind_id] + rnorm(n_obs) }
+  if(np["M7"]>0) D[,(curr+1):total_feat] <- matrix(rnorm(n_obs*np["M7"]), nrow=n_obs)
+  
+  true_cls <- rep(names(np), times = np)
+  return(list(D = D, Nutri = Nutri, time = time_all, true_cls = true_cls))
+}
+
+safe_lmer <- function(form, data, REML) {
+  require(lme4)
+  ctrl <- lmerControl(check.conv.singular = "ignore", calc.derivs = FALSE)
+  tryCatch(lmer(form, data = data, REML = REML, control = ctrl),
+           error = function(e) NULL, warning = function(w) invokeRestart("muffleWarning"))
+}
+
+calculate_effect_shares <- function(y, id, time, Nutri_mat) {
+  require(lme4) 
+  df <- data.frame(y=y, id=factor(id), time=factor(time))
+  N <- scale(Nutri_mat, center=TRUE, scale=FALSE)
+  df <- cbind(df, as.data.frame(N))
+  nutri_cols <- colnames(N)
+  inter_term <- paste0("(", paste(nutri_cols, collapse="+"), ")")
+  form <- as.formula(paste0("y ~ ", inter_term, "*time + (1|id)"))
+  
+  fit <- safe_lmer(form, df, TRUE)
+  if(is.null(fit)) return(rep(0, 5))
+  
+  X <- model.matrix(fit); b <- fixef(fit); cn <- colnames(X)
+  idx_nut <- grepl(paste0("^(", paste(nutri_cols, collapse="|"), ")$"), cn)
+  idx_time <- grepl("^time", cn) & !grepl(":", cn)
+  idx_int <- grepl(":", cn)
+  
+  calc_SS <- function(idx) { if(sum(idx)==0) return(0); eff <- as.numeric(X[,idx,drop=FALSE]%*%b[idx]); sum((eff-mean(eff))^2) }
+  
+  SS_parts <- c(calc_SS(idx_int), calc_SS(idx_nut), calc_SS(idx_time))
+  ran <- ranef(fit)$id[,1]; SS_id <- sum(ran[df$id]^2)
+  SS_eps <- sum(residuals(fit)^2)
+  Ttot <- sum(SS_parts) + SS_id + SS_eps
+  if(Ttot < 1e-9) return(rep(0, 5))
+  res <- c(SS_parts, SS_id, SS_eps)/Ttot; res[res<0] <- 0
+  if(sum(res)==0) return(rep(0,5))
+  return(res/sum(res))
+}
+
+
+
+```
+
+
+
+```{r}
+run_simulation_comparison <- function(n_ind_current) {
+  
+  gen <- Generate_Data_MC(n_ind_current)
+  D <- gen$D; Nutri <- gen$Nutri; true_cls <- gen$true_cls
+  n_feat <- ncol(D); n_time <- 3
+  
+  design <- data.frame(id=rep(1:n_ind_current, each=n_time), time=rep(c(0,6,12), times=n_ind_current))
+  design$time_fac <- factor(design$time)
+  NutriC <- as.data.frame(scale(Nutri, center=TRUE, scale=FALSE))
+  base_df <- cbind(data.frame(id=factor(design$id), time=factor(design$time_fac)), NutriC)
+  nutri_terms <- paste(colnames(NutriC), collapse=" + ")
+  
+  export_vars <- c("safe_lmer", "calculate_effect_shares", "calc_empirical_p_vec")
+  
+  obs_shares_mat <- foreach(j = 1:n_feat, .combine = rbind, 
+                            .export = export_vars, 
+                            .packages = c('lme4', 'methods')) %dopar% {
+                              calculate_effect_shares(D[,j], design$id, design$time, Nutri)
+                            }
+  
+  null_shares_results <- foreach(j = 1:n_feat, .combine = rbind, 
+                                 .export = export_vars, 
+                                 .packages = c('lme4', 'methods')) %dopar% {
+    temp_df <- base_df; temp_df$y <- D[,j]
+    fit <- safe_lmer(as.formula(paste0("y ~ time * (", nutri_terms, ") + (1|id)")), temp_df, TRUE)
+    if(is.null(fit)) return(rep(NA, 4))
+    
+    fix <- fixef(fit); res <- residuals(fit)
+    ran <- tryCatch(ranef(fit)$id[temp_df$id, 1], error=function(e) rep(0, nrow(temp_df)))
+    X_full <- model.matrix(fit)
+    
+    # H0 Inter
+    X_main <- model.matrix(as.formula(paste0("~ time + ", nutri_terms)), data=temp_df)
+    b_main <- fix[match(colnames(X_main), names(fix))]; b_main[is.na(b_main)] <- 0
+    y_null_I <- as.numeric(X_main %*% b_main) + ran + sample(res, replace=TRUE)
+    s_I <- calculate_effect_shares(y_null_I, temp_df$id, temp_df$time, Nutri)[1]
+    
+    # H0 Nutri
+    idx_noN <- !grepl("Nutri", names(fix))
+    y_noN <- as.numeric(X_full[, idx_noN, drop=FALSE] %*% fix[idx_noN]) + ran + sample(res, replace=TRUE)
+    s_N <- calculate_effect_shares(y_noN, temp_df$id, temp_df$time, Nutri)[2]
+    
+    # H0 Time
+    idx_noT <- !grepl("time", names(fix))
+    y_noT <- as.numeric(X_full[, idx_noT, drop=FALSE] %*% fix[idx_noT]) + ran + sample(res, replace=TRUE)
+    s_T <- calculate_effect_shares(y_noT, temp_df$id, temp_df$time, Nutri)[3]
+    
+    # H0 RI
+    y_noRI <- as.numeric(X_full %*% fix) + sample(res, replace=TRUE)
+    s_R <- calculate_effect_shares(y_noRI, temp_df$id, temp_df$time, Nutri)[4]
+    
+    c(s_I, s_N, s_T, s_R)
+  }
+  
+  null_dist_I <- na.omit(null_shares_results[,1])
+  null_dist_N <- na.omit(null_shares_results[,2])
+  null_dist_T <- na.omit(null_shares_results[,3])
+  null_dist_R <- na.omit(null_shares_results[,4])
+  
+
+  # Method A: Original (Cutoff based)
+  cutoff_I <- quantile(null_dist_I, 0.95, na.rm=TRUE)
+  cutoff_N <- quantile(null_dist_N, 0.95, na.rm=TRUE)
+  cutoff_T <- quantile(null_dist_T, 0.95, na.rm=TRUE)
+  cutoff_R <- quantile(null_dist_R, 0.95, na.rm=TRUE)
+  
+  S <- obs_shares_mat
+  pred_cutoff <- rep("M5", n_feat)
+  
+  is_M1 <- S[,1] > cutoff_I
+  pred_cutoff[is_M1] <- "M1"
+  mask <- !is_M1
+  has_RI <- mask & (S[,4] > cutoff_R)
+  no_RI  <- mask & (S[,4] <= cutoff_R)
+  
+  pred_cutoff[has_RI & (S[,2] > cutoff_N) & (S[,3] > cutoff_T)]  <- "M2"
+  pred_cutoff[has_RI & (S[,2] > cutoff_N) & (S[,3] <= cutoff_T)] <- "M3"
+  pred_cutoff[has_RI & (S[,2] <= cutoff_N) & (S[,3] > cutoff_T)] <- "M4"
+  pred_cutoff[has_RI & (S[,2] <= cutoff_N) & (S[,3] <= cutoff_T)] <- "M6"
+  
+  is_M5 <- no_RI & ((S[,2] > cutoff_N) | (S[,3] > cutoff_T))
+  pred_cutoff[is_M5] <- "M5"
+  pred_cutoff[no_RI & !is_M5] <- "M7"
+  
+  acc_cutoff <- mean(pred_cutoff == true_cls)
+  
+  # Method B: New (Empirical P + BH Correction)
+  p_emp_I <- calc_empirical_p_vec(S[,1], null_dist_I)
+  p_emp_N <- calc_empirical_p_vec(S[,2], null_dist_N)
+  p_emp_T <- calc_empirical_p_vec(S[,3], null_dist_T)
+  p_emp_R <- calc_empirical_p_vec(S[,4], null_dist_R)
+  
+  p_adj_I <- p.adjust(p_emp_I, method = "BH")
+  p_adj_N <- p.adjust(p_emp_N, method = "BH")
+  p_adj_T <- p.adjust(p_emp_T, method = "BH")
+  p_adj_R <- p.adjust(p_emp_R, method = "BH")
+  
+  alpha <- 0.05
+  pred_bh <- rep("M5", n_feat)
+  is_sig_I <- p_adj_I < alpha
+  pred_bh[is_sig_I] <- "M1"
+  mask <- !is_sig_I
+  
+  is_sig_R <- mask & (p_adj_R < alpha)
+  no_sig_R <- mask & (p_adj_R >= alpha)
+  sig_N <- p_adj_N < alpha
+  sig_T <- p_adj_T < alpha
+  
+  pred_bh[is_sig_R & sig_N & sig_T]  <- "M2"
+  pred_bh[is_sig_R & sig_N & !sig_T] <- "M3"
+  pred_bh[is_sig_R & !sig_N & sig_T] <- "M4"
+  pred_bh[is_sig_R & !sig_N & !sig_T] <- "M6"
+  
+  is_sig_fixed <- no_sig_R & (sig_N | sig_T)
+  pred_bh[is_sig_fixed] <- "M5"
+  pred_bh[no_sig_R & !is_sig_fixed] <- "M7"
+  
+  acc_bh <- mean(pred_bh == true_cls)
+  
+  return(c(acc_cutoff=acc_cutoff, acc_bh=acc_bh))
+}
+
+
+
+n_cores <- max(1, parallel::detectCores() - 2)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+
+
+final_results_list <- list()
+
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+for (b in 1:B) {
+  res_vec <- tryCatch({
+    run_simulation_comparison(FIXED_N_IND)
+  }, error = function(e) {
+    message(paste0("\nError in simulation ", b, ": ", e$message))
+    return(NULL)
+  })
+  
+  if(!is.null(res_vec)) {
+    final_results_list[[b]] <- res_vec
+  }
+  setTxtProgressBar(pb, b)
+}
+
+close(pb)
+stopCluster(cl) 
+
+final_res <- do.call(rbind, final_results_list) %>% as.data.frame()
+final_res$Sample_Size <- FIXED_N_IND
+```
+
+
+
+```{r}
+if(nrow(final_res) > 0) {
+  plot_data <- final_res %>%
+    pivot_longer(cols = c(acc_cutoff, acc_bh), 
+                 names_to = "Method", 
+                 values_to = "Accuracy") %>%
+    mutate(Method = factor(Method, 
+                           levels = c("acc_cutoff", "acc_bh"),
+                           labels = c("Original (Cutoff)", "Empirical P + BH"))) %>%
+    mutate(Sample_Size = factor(Sample_Size))
+  
+  avg_gain <- mean(final_res$acc_bh - final_res$acc_cutoff)
+  message(sprintf("\n (Average Gain): +%.2f%%\n", avg_gain * 100))
+  
+  summary_tab <- plot_data %>%
+    group_by(Sample_Size, Method) %>%
+    summarise(Mean_Acc = mean(Accuracy), .groups='drop')
+  print(summary_tab)
+  
+  p <- ggplot(plot_data, aes(x = Sample_Size, y = Accuracy, fill = Method)) +
+    geom_boxplot(alpha = 0.7, width = 0.5, position = position_dodge(width = 0.6)) +
+    geom_point(position = position_jitterdodge(jitter.width = 0.05, dodge.width = 0.6), 
+               alpha = 0.5, size = 2) +
+    labs(title = paste0("Classification Accuracy at Fixed N=", FIXED_N_IND),
+         subtitle = paste0("Comparison over ", B, " repetitions\n",
+                           "Empirical P + BH shows improved performance"),
+         y = "Classification Accuracy",
+         x = "Fixed Sample Size") +
+    scale_fill_brewer(palette = "Paired") +
+    theme_minimal() +
+    theme(legend.position = "top", 
+          text = element_text(size = 12),
+          plot.subtitle = element_text(color = "gray30"))
+  
+  print(p)
+}
+```
+
+
+
